@@ -1,0 +1,16 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.metrics.statsd
+name: StatsD Metrics Sink
+license: Apache-2.0
+description: |
+  A metrics_sink that formats each metric data point as a statsd / DogStatsD
+  line and pushes it to a UDP collector (statsd, DogStatsD, Telegraf) or to
+  stdout / stderr. Counters → name:value|c, gauges → |g, histograms → one |h
+  (or |ms / |d) sample per observation. Labels become DogStatsD tags (|#k:v)
+  when enabled; optional metric-name prefix. Best-effort delivery; pure
+  formatter + socket emit. Fails closed on bad config.
+class: metrics_sink
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  - network_outbound

@@ -1,0 +1,21 @@
+[package]
+name = "mcpg-plugin-metrics-statsd"
+version = "0.1.0-alpha.15"
+license = "Apache-2.0"
+edition = "2024"
+description = "StatsD metrics_sink plugin for MCPG (dev.mcpg.metrics.statsd) — statsd / DogStatsD line protocol over UDP / stdout / stderr."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", features = ["static-firstparty"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[features]
+default = ["cdylib-export"]
+cdylib-export = []
+static-firstparty = []
