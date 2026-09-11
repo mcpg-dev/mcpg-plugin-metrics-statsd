@@ -41,7 +41,7 @@ plugins:
     kind: native
     class: metrics_sink
     source:
-      oci: ghcr.io/mcpg-dev/source-code/plugins/metrics-statsd:protocol-1
+      oci: ghcr.io/mcpg-dev/plugins/metrics-statsd
     granted_capabilities:
       - network_outbound
     config:
