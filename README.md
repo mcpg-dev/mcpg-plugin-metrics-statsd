@@ -14,8 +14,14 @@ from the gateway.
 ## What it does
 - Renders counters as `name:value|c`, gauges as `name:value|g`, and histograms
   as one line per observation with a configurable `|h`, `|ms`, or `|d` suffix.
-- Falls back to the histogram's `sum` as a single line when a point carries
-  aggregates but no individual observations.
+- Sends a histogram point's observations with the sample rate (`|@0.25`) when
+  the point counts more samples than it carries, so the collector's count is
+  exact; the gateway sends at most 64 observations per series and second.
+  A point with a count but no observations is sent as its mean at rate
+  `1/count`; one with neither as its `sum`.
+- Sends a negative gauge as `name:0|g` followed by `name:-v|g`, because statsd
+  reads a signed gauge value as a change.
+- Splits the lines of one point into datagrams of at most 1432 bytes.
 - Appends labels as DogStatsD tags (`|#key:value,key2:value2`) when enabled;
   disable tagging for a vanilla statsd server that cannot parse them.
 - Replaces statsd metasyntax — `:`, `|`, `@`, `#`, `,`, and whitespace — with

@@ -3,9 +3,10 @@
 //! Formats each metric data point as a statsd / DogStatsD line and pushes it to
 //! a UDP collector (statsd, DogStatsD, Telegraf, …) or to stdout / stderr.
 //! Counters → `name:value|c`, gauges → `|g`, histograms → one `|h` (or `|ms` /
-//! `|d`) sample per observation. Labels become DogStatsD tags (`|#k:v,…`) when
-//! enabled. Best-effort delivery; pure formatter + `std::net` emit. Fails closed
-//! on bad config.
+//! `|d`) sample per observation, with the sample rate (`|@r`) when the point
+//! counts more samples than it carries. Labels become DogStatsD tags
+//! (`|#k:v,…`) when enabled. Best-effort delivery; pure formatter + `std::net`
+//! emit. Fails closed on bad config.
 
 use std::io::Write;
 use std::net::UdpSocket;
@@ -112,6 +113,67 @@ fn scalar(value: &MetricValue) -> Option<String> {
     }
 }
 
+/// The lines of a histogram point. Observations sampled from a larger
+/// `count` carry the sample rate, so the collector counts `count` samples.
+fn histogram_lines(
+    name: &str,
+    h: &str,
+    tags: &str,
+    count: u64,
+    sum: f64,
+    observations: &[f64],
+) -> String {
+    let sampled = observations.len() as u64;
+    if sampled == 0 {
+        if count <= 1 {
+            return format!("{name}:{}|{h}{tags}", fmt_f64(sum));
+        }
+        // The mean once at rate 1/count: `count` samples that add up to `sum`.
+        let rate = 1.0 / count as f64;
+        return format!(
+            "{name}:{}|{h}|@{}{tags}",
+            fmt_f64(sum / count as f64),
+            fmt_f64(rate)
+        );
+    }
+    let rate = if count > sampled {
+        format!("|@{}", fmt_f64(sampled as f64 / count as f64))
+    } else {
+        String::new()
+    };
+    observations
+        .iter()
+        .map(|o| format!("{name}:{}|{h}{rate}{tags}", fmt_f64(*o)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Largest datagram sent: it fits one Ethernet frame, so no collector
+/// sees a fragment or truncates a packet.
+const MAX_DATAGRAM_BYTES: usize = 1432;
+
+/// Splits newline-joined lines into datagrams of at most
+/// `MAX_DATAGRAM_BYTES` at line boundaries; a longer line goes alone.
+fn datagrams(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut fits = 0;
+    for (newline, _) in text
+        .match_indices('\n')
+        .chain(std::iter::once((text.len(), "")))
+    {
+        if newline - start > MAX_DATAGRAM_BYTES && fits > start {
+            out.push(&text[start..fits]);
+            start = fits + 1;
+        }
+        fits = newline;
+    }
+    if fits > start {
+        out.push(&text[start..fits]);
+    }
+    out
+}
+
 impl StatsdSink {
     /// SDK factory. Fails closed: a bad config or an unbindable UDP socket
     /// panics (→ null handle → boot Err).
@@ -173,31 +235,27 @@ impl StatsdSink {
         let name = self.metric_name(&metric.name);
         let tags = self.tags(metric);
         match metric.kind {
-            MetricKind::Counter | MetricKind::Gauge => {
-                let t = if metric.kind == MetricKind::Counter {
-                    "c"
-                } else {
-                    "g"
-                };
+            MetricKind::Counter => {
                 let val = scalar(&metric.value).unwrap_or_else(|| "0".to_owned());
-                format!("{name}:{val}|{t}{tags}")
+                format!("{name}:{val}|c{tags}")
+            }
+            MetricKind::Gauge => {
+                let val = scalar(&metric.value).unwrap_or_else(|| "0".to_owned());
+                // statsd reads a signed gauge value as a change, so a negative value follows a reset to 0.
+                if val.starts_with('-') {
+                    format!("{name}:0|g{tags}\n{name}:{val}|g{tags}")
+                } else {
+                    format!("{name}:{val}|g{tags}")
+                }
             }
             MetricKind::Histogram => {
                 let h = self.histogram_type.suffix();
                 match &metric.value {
                     MetricValue::Histogram {
-                        observations, sum, ..
-                    } => {
-                        if observations.is_empty() {
-                            format!("{name}:{}|{h}{tags}", fmt_f64(*sum))
-                        } else {
-                            observations
-                                .iter()
-                                .map(|o| format!("{name}:{}|{h}{tags}", fmt_f64(*o)))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }
-                    }
+                        count,
+                        sum,
+                        observations,
+                    } => histogram_lines(&name, h, &tags, *count, *sum, observations),
                     // Kind says histogram but a scalar value was supplied.
                     other => {
                         let val = scalar(other).unwrap_or_else(|| "0".to_owned());
@@ -218,8 +276,10 @@ impl SyncMetricsSink for StatsdSink {
         let line = self.render(metric);
         match &self.emitter {
             Emitter::Udp { socket, address } => {
-                if let Err(e) = socket.send_to(line.as_bytes(), address.as_str()) {
-                    tracing::debug!(error = %e, "metrics-statsd: udp send failed; dropping point");
+                for datagram in datagrams(&line) {
+                    if let Err(e) = socket.send_to(datagram.as_bytes(), address.as_str()) {
+                        tracing::debug!(error = %e, "metrics-statsd: udp send failed; dropping point");
+                    }
                 }
             }
             Emitter::Stdout => {

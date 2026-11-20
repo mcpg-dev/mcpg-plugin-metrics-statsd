@@ -6,7 +6,7 @@ use mcpg_plugin_protocol::telemetry::{MetricKind, MetricPoint, MetricValue};
 use mcpg_plugin_sdk::ffi::SyncMetricsSink;
 use serde_json::{Value, json};
 
-use super::{PLUGIN_ID, StatsdSink};
+use super::{MAX_DATAGRAM_BYTES, PLUGIN_ID, StatsdSink, datagrams};
 
 fn build(cfg: Value) -> StatsdSink {
     StatsdSink::from_config_json(&cfg.to_string())
@@ -93,6 +93,92 @@ fn histogram_empty_observations_uses_sum() {
         },
     );
     assert_eq!(p.render(&h), "lat:10|h");
+}
+
+fn sampled_histogram(count: u64, sum: f64, observations: Vec<f64>) -> MetricPoint {
+    point(
+        "lat",
+        MetricKind::Histogram,
+        MetricValue::Histogram {
+            count,
+            sum,
+            observations,
+        },
+    )
+}
+
+#[test]
+fn histogram_sample_of_more_observations_carries_the_rate() {
+    let p = build(json!({ "destination": { "kind": "stdout" } }));
+    assert_eq!(
+        p.render(&sampled_histogram(8, 20.0, vec![1.0, 2.0])),
+        "lat:1|h|@0.25\nlat:2|h|@0.25"
+    );
+    let mut tagged = sampled_histogram(4, 4.0, vec![1.0, 3.0]);
+    tagged.labels.insert("env".into(), "prod".into());
+    assert_eq!(
+        p.render(&tagged),
+        "lat:1|h|@0.5|#env:prod\nlat:3|h|@0.5|#env:prod"
+    );
+}
+
+#[test]
+fn histogram_count_without_observations_sends_the_mean_at_rate_one_over_count() {
+    let p = build(json!({ "destination": { "kind": "stdout" } }));
+    assert_eq!(
+        p.render(&sampled_histogram(4, 10.0, vec![])),
+        "lat:2.5|h|@0.25"
+    );
+}
+
+#[test]
+fn negative_gauge_follows_a_reset_to_zero() {
+    let p = build(json!({ "destination": { "kind": "stdout" } }));
+    assert_eq!(p.render(&gauge("temp", -2.0)), "temp:0|g\ntemp:-2|g");
+    assert_eq!(p.render(&gauge("temp", 0.0)), "temp:0|g");
+}
+
+#[test]
+fn lines_split_into_datagrams_at_line_boundaries() {
+    let line = "x".repeat(600);
+    let text = [line.as_str(); 5].join("\n");
+    let parts = datagrams(&text);
+    assert_eq!(parts.len(), 3);
+    assert!(parts.iter().all(|d| d.len() <= MAX_DATAGRAM_BYTES));
+    assert_eq!(parts.join("\n"), text);
+    let long = "y".repeat(MAX_DATAGRAM_BYTES + 10);
+    assert_eq!(datagrams(&long), [long.as_str()]);
+    assert_eq!(datagrams("a:1|c"), ["a:1|c"]);
+}
+
+#[test]
+fn udp_histogram_of_many_observations_arrives_whole_in_several_datagrams() {
+    let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+    listener
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let p = build(json!({ "destination": { "kind": "udp", "address": addr } }));
+    let observations: Vec<f64> = (0..64).map(|v| f64::from(v) + 1000.5).collect();
+    let mut m = sampled_histogram(640, 0.0, observations);
+    m.labels.insert("route".into(), "r".repeat(40));
+    assert!(p.render(&m).len() > 2 * MAX_DATAGRAM_BYTES);
+    p.emit(&m);
+    let mut lines = Vec::new();
+    let mut buf = [0u8; 65536];
+    while lines.len() < 64 {
+        let (n, _) = listener
+            .recv_from(&mut buf)
+            .expect("datagram should arrive");
+        assert!(n <= MAX_DATAGRAM_BYTES);
+        lines.extend(
+            std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .lines()
+                .map(str::to_owned),
+        );
+    }
+    assert_eq!(lines.join("\n"), p.render(&m));
 }
 
 #[test]
